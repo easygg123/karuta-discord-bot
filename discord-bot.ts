@@ -1,175 +1,198 @@
-import {
-  Client,
-  GatewayIntentBits,
-  Message,
-  TextChannel,
-  Partials,
-} from "discord.js";
 import { logger } from "./lib/logger";
+import Tesseract from "tesseract.js";
 
-const DISCORD_TOKEN = process.env["DISCORD_TOKEN"];
-const DISCORD_CHANNEL_ID = process.env["DISCORD_CHANNEL_ID"];
-const KARUTA_BOT_ID = process.env["KARUTA_BOT_ID"] ?? "646937666251915264";
+const TOKEN = process.env["DISCORD_TOKEN"];
+const CHANNEL_ID = process.env["DISCORD_CHANNEL_ID"];
+const KARUTA_ID = process.env["KARUTA_BOT_ID"] ?? "646988964364451840";
 
-const KD_INTERVAL_MS = 1_860_000;
+const BASE_URL = "https://discord.com/api/v9";
 
-// Number emojis to react with: position 1, 2 or 3
-const POSITION_EMOJIS = ["1️⃣", "2️⃣", "3️⃣"];
+const EMOJIS_URL: Record<string, string> = {
+  "1": "1%EF%B8%8F%E2%83%A3",
+  "2": "2%EF%B8%8F%E2%83%A3",
+  "3": "3%EF%B8%8F%E2%83%A3",
+  "4": "4%EF%B8%8F%E2%83%A3",
+};
 
-// Store the last Karuta drop message so Card Companion response can reference it
-let lastKarutaDrop: Message | null = null;
-// Timeout to clear the last drop if no CC response arrives
-let dropTimeout: ReturnType<typeof setTimeout> | null = null;
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
-function clearDrop() {
-  lastKarutaDrop = null;
-  if (dropTimeout) {
-    clearTimeout(dropTimeout);
-    dropTimeout = null;
+function discordHeaders() {
+  return {
+    Authorization: TOKEN!,
+    "Content-Type": "application/json",
+    "User-Agent": "Mozilla/5.0",
+  };
+}
+
+async function sendMessage(content: string) {
+  const res = await fetch(`${BASE_URL}/channels/${CHANNEL_ID}/messages`, {
+    method: "POST",
+    headers: discordHeaders(),
+    body: JSON.stringify({ content }),
+  });
+  if (!res.ok) {
+    logger.warn({ status: res.status }, "Error sending message");
   }
 }
 
-function isKarutaDrop(message: Message): boolean {
-  if (message.author.id !== KARUTA_BOT_ID) return false;
-  // Karuta drop messages contain an embed with fields and "drop" related content
-  if (message.embeds.length === 0) return false;
-  const embed = message.embeds[0];
-  // Karuta drops typically have a description or title referencing cards
-  const content = (embed.description ?? "") + (embed.title ?? "");
-  return (
-    content.toLowerCase().includes("card") ||
-    message.components.length > 0 ||
-    embed.fields.length > 0
-  );
+interface DiscordMessage {
+  id: string;
+  content: string;
+  author: { id: string; username: string };
+  attachments: { url: string }[];
+  embeds: { description?: string; title?: string; fields?: { name: string; value: string }[] }[];
 }
 
-function extractPositionFromCC(message: Message): number | null {
-  const fullText =
-    (message.content ?? "") +
-    message.embeds
-      .map((e) => (e.description ?? "") + (e.title ?? "") + e.fields.map((f) => f.name + f.value).join(" "))
-      .join(" ");
+async function getRecentMessages(limit = 5): Promise<DiscordMessage[]> {
+  const res = await fetch(
+    `${BASE_URL}/channels/${CHANNEL_ID}/messages?limit=${limit}`,
+    { headers: discordHeaders() }
+  );
+  if (!res.ok) return [];
+  return res.json() as Promise<DiscordMessage[]>;
+}
 
-  const lower = fullText.toLowerCase();
+async function reactToMessage(messageId: string, position: string) {
+  const emoji = EMOJIS_URL[position];
+  if (!emoji) return;
+  const url = `${BASE_URL}/channels/${CHANNEL_ID}/messages/${messageId}/reactions/${emoji}/@me`;
+  const res = await fetch(url, {
+    method: "PUT",
+    headers: discordHeaders(),
+  });
+  if (res.status === 204 || res.status === 201) {
+    logger.info({ position }, `✅ Reacción enviada a carta ${position}`);
+  } else {
+    logger.warn({ status: res.status }, "❌ Error al reaccionar");
+  }
+}
 
-  // Card Companion usually says something like "Card 1 has the most WL"
-  // or "#1" or "position 1" or just "1" near "wl" or "wishlist"
-  // We look for patterns like "card 1", "#1", "position 1" near wl references
-  const patterns = [
-    /card\s*[#\-]?\s*([123])\s*(?:has|is|with)?\s*(?:the\s*)?(?:most|highest|more)\s*wl/i,
-    /([123])\s*(?:has|is|with)?\s*(?:the\s*)?(?:most|highest|more)\s*wl/i,
-    /highest\s*wl[^0-9]*([123])/i,
-    /most\s*(?:wl|wishlists?)[^0-9]*([123])/i,
-    /#([123])/i,
-    /position\s*([123])/i,
-  ];
+async function runOCR(imageUrl: string): Promise<string> {
+  try {
+    const { data } = await Tesseract.recognize(imageUrl, "eng", {
+      logger: () => {},
+    });
+    return data.text;
+  } catch (err) {
+    logger.warn({ err }, "⚠️ Error en OCR");
+    return "";
+  }
+}
 
-  for (const pattern of patterns) {
-    const match = fullText.match(pattern);
-    if (match) {
-      const pos = parseInt(match[1], 10);
-      if (pos >= 1 && pos <= 3) return pos;
+function extractPositionFromCC(messages: DiscordMessage[]): string {
+  for (const msg of messages) {
+    const name = msg.author.username.toLowerCase();
+    if (!name.includes("card") && !name.includes("companion") && !name.includes("cc")) continue;
+
+    const fullText =
+      msg.content +
+      msg.embeds
+        .map((e) =>
+          (e.description ?? "") +
+          (e.title ?? "") +
+          (e.fields ?? []).map((f) => f.name + " " + f.value).join(" ")
+        )
+        .join(" ");
+
+    const patterns = [
+      /card\s*[#\-]?\s*([123])\s*(?:has|is|with)?\s*(?:the\s*)?(?:most|highest|more)\s*wl/i,
+      /([123])\s*(?:has|is|with)?\s*(?:the\s*)?(?:most|highest|more)\s*wl/i,
+      /highest\s*wl[^0-9]*([123])/i,
+      /most\s*(?:wl|wishlists?)[^0-9]*([123])/i,
+    ];
+
+    for (const pattern of patterns) {
+      const match = fullText.match(pattern);
+      if (match) return match[1];
     }
   }
-
-  // Fallback: look for standalone 1, 2, or 3 in the context of wl
-  if (lower.includes("wl") || lower.includes("wishlist")) {
-    for (const pos of [1, 2, 3]) {
-      if (lower.includes(String(pos))) return pos;
-    }
-  }
-
-  return null;
+  return "";
 }
 
-function isCardCompanionMessage(message: Message): boolean {
-  // Card Companion bot name — adjust if the bot has a different name/ID in your server
-  const name = message.author.username.toLowerCase();
-  return (
-    name.includes("card") &&
-    (name.includes("companion") || name.includes("cc"))
-  );
+async function runCycle() {
+  logger.info(`[${new Date().toLocaleTimeString()}] --- Enviando kd ---`);
+  await sendMessage("kd");
+
+  let dropId: string | null = null;
+  let imageUrl: string | null = null;
+
+  // Esperar el mensaje de Karuta con la imagen (hasta 24 segundos)
+  for (let i = 0; i < 6; i++) {
+    await sleep(4000);
+    const messages = await getRecentMessages(5);
+    for (const msg of messages) {
+      if (
+        msg.author.id === KARUTA_ID &&
+        msg.content.toLowerCase().includes("dropping") &&
+        msg.attachments.length > 0
+      ) {
+        dropId = msg.id;
+        imageUrl = msg.attachments[0].url;
+        break;
+      }
+    }
+    if (dropId) break;
+  }
+
+  if (!dropId || !imageUrl) {
+    logger.warn("❌ No se encontró el drop de Karuta.");
+    return;
+  }
+
+  logger.info({ dropId }, `📸 Drop detectado. Procesando imagen...`);
+
+  // OCR de la imagen
+  const ocrText = await runOCR(imageUrl);
+  if (ocrText) {
+    logger.info(`🔍 OCR leyó: ${ocrText.slice(0, 80).replace(/\n/g, " ")}...`);
+  }
+
+  // Esperar respuesta de Card Companion (hasta 10 segundos)
+  let targetPosition = "";
+  for (let i = 0; i < 5; i++) {
+    await sleep(2000);
+    const messages = await getRecentMessages(8);
+    targetPosition = extractPositionFromCC(messages);
+    if (targetPosition) break;
+  }
+
+  if (!targetPosition) {
+    logger.info("ℹ️ Card Companion no respondió, reaccionando a carta 1 por defecto");
+    targetPosition = "1";
+  }
+
+  await reactToMessage(dropId, targetPosition);
 }
 
 export function startDiscordBot() {
-  if (!DISCORD_TOKEN) {
-    logger.warn("DISCORD_TOKEN not set — Discord bot will not start");
+  if (!TOKEN) {
+    logger.warn("DISCORD_TOKEN no configurado — bot de Discord no iniciará");
     return;
   }
-  if (!DISCORD_CHANNEL_ID) {
-    logger.warn("DISCORD_CHANNEL_ID not set — Discord bot will not start");
+  if (!CHANNEL_ID) {
+    logger.warn("DISCORD_CHANNEL_ID no configurado — bot de Discord no iniciará");
     return;
   }
 
-  const client = new Client({
-    intents: [
-      GatewayIntentBits.Guilds,
-      GatewayIntentBits.GuildMessages,
-      GatewayIntentBits.MessageContent,
-      GatewayIntentBits.GuildMessageReactions,
-    ],
-    partials: [Partials.Message, Partials.Reaction],
-  });
+  logger.info("🤖 Bot de Discord iniciado (modo polling)");
 
-  client.once("ready", () => {
-    logger.info({ tag: client.user?.tag }, "Discord bot ready");
-
-    // Send kd immediately, then every KD_INTERVAL_MS
-    sendKd();
-    setInterval(sendKd, KD_INTERVAL_MS);
-  });
-
-  async function sendKd() {
-    try {
-      const channel = await client.channels.fetch(DISCORD_CHANNEL_ID!);
-      if (!channel || !channel.isTextBased()) {
-        logger.error({ channelId: DISCORD_CHANNEL_ID }, "Channel not found or not text-based");
-        return;
+  async function loop() {
+    while (true) {
+      try {
+        await runCycle();
+      } catch (err) {
+        logger.error({ err }, "🔴 Error en el ciclo del bot");
       }
-      await (channel as TextChannel).send("kd");
-      logger.info({ channelId: DISCORD_CHANNEL_ID }, "Sent 'kd'");
-    } catch (err) {
-      logger.error({ err }, "Failed to send 'kd'");
+
+      // 1860 segundos + random entre 10 y 45 para evitar detección
+      const jitter = Math.floor(Math.random() * 36) + 10;
+      const wait = (1860 + jitter) * 1000;
+      logger.info(`⏳ Próximo kd en ${1860 + jitter} segundos`);
+      await sleep(wait);
     }
   }
 
-  client.on("messageCreate", async (message) => {
-    // Only process messages in the configured channel
-    if (message.channelId !== DISCORD_CHANNEL_ID) return;
-
-    // Detect a Karuta card drop
-    if (isKarutaDrop(message)) {
-      logger.info({ messageId: message.id }, "Detected Karuta card drop");
-      clearDrop();
-      lastKarutaDrop = message;
-      // Give Card Companion 15 seconds to respond
-      dropTimeout = setTimeout(() => {
-        logger.info("No CC response within 15s — clearing drop");
-        clearDrop();
-      }, 15_000);
-      return;
-    }
-
-    // Detect Card Companion response
-    if (isCardCompanionMessage(message) && lastKarutaDrop) {
-      const position = extractPositionFromCC(message);
-      if (position !== null) {
-        const emoji = POSITION_EMOJIS[position - 1];
-        logger.info({ position, emoji }, "CC indicated best card position — reacting");
-        try {
-          await lastKarutaDrop.react(emoji);
-          logger.info({ emoji }, "Reacted to Karuta drop");
-        } catch (err) {
-          logger.error({ err }, "Failed to react to Karuta drop");
-        }
-        clearDrop();
-      } else {
-        logger.warn({ content: message.content }, "Could not parse position from Card Companion message");
-      }
-    }
-  });
-
-  client.login(DISCORD_TOKEN).catch((err) => {
-    logger.error({ err }, "Failed to login to Discord");
-  });
+  loop();
 }
