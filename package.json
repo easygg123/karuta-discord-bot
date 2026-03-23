@@ -1,0 +1,20 @@
+{
+  "name": "karuta-discord-bot",
+  "version": "1.0.0",
+  "description": "Discord bot para agarrar cartas de Karuta con mayor WL",
+  "type": "module",
+  "main": "index.ts",
+  "scripts": {
+    "dev": "tsx index.ts",
+    "start": "node dist/index.mjs"
+  },
+  "dependencies": {
+    "discord.js": "^14.x",
+    "pino": "^9",
+    "pino-http": "^10"
+  },
+  "devDependencies": {
+    "tsx": "^4",
+    "typescript": "^5"
+  }
+}
